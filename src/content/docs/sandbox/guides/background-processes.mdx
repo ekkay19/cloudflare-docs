@@ -22,6 +22,8 @@ Use `startProcess()` instead of `exec()` when:
 
 :::note
 For **one-time commands, builds, or scripts that complete and exit**, use `exec()` instead. See the [Execute commands guide](/sandbox/guides/execute-commands/).
+
+If you need to start a process in the background and wait for it to complete (for example, to run parallel builds or tests), use `startProcess()` with `waitForExit()`.
 :::
 
 ## Start a background process
@@ -107,6 +109,54 @@ const server = await sandbox.startProcess('node server.js');
 // Wait for log message
 const result = await server.waitForLog('Server listening');
 console.log('Server is ready:', result.line);
+```
+</TypeScriptExample>
+
+## Wait for process completion
+
+For processes that complete on their own (builds, tests, scripts), use `waitForExit()` to wait for them to finish and get their exit code:
+
+<TypeScriptExample>
+```
+// Run a build process
+const build = await sandbox.startProcess('npm run build');
+
+// Wait for it to complete
+const result = await build.waitForExit(300000); // 5 minute timeout
+
+if (result.exitCode === 0) {
+  console.log('Build succeeded');
+} else {
+  console.error('Build failed:', result.stderr);
+  throw new Error('Build process failed');
+}
+```
+</TypeScriptExample>
+
+This is useful for running multiple builds or tests in parallel:
+
+<TypeScriptExample>
+```
+// Start multiple test suites in parallel
+const unit = await sandbox.startProcess('npm run test:unit');
+const integration = await sandbox.startProcess('npm run test:integration');
+const e2e = await sandbox.startProcess('npm run test:e2e');
+
+// Wait for all to complete
+const [unitResult, integrationResult, e2eResult] = await Promise.all([
+  unit.waitForExit(),
+  integration.waitForExit(),
+  e2e.waitForExit()
+]);
+
+// Check results
+const allPassed = [unitResult, integrationResult, e2eResult].every(r => r.exitCode === 0);
+
+if (allPassed) {
+  console.log('All tests passed');
+} else {
+  console.error('Some tests failed');
+}
 ```
 </TypeScriptExample>
 
@@ -226,6 +276,7 @@ When using `keepAlive: true`, containers will not automatically timeout. You **m
 ## Best practices
 
 - **Wait for readiness** - Use `waitForPort()` or `waitForLog()` to detect when services are ready
+- **Wait for completion** - Use `waitForExit()` for processes that complete on their own (builds, tests, scripts)
 - **Clean up** - Always stop processes when done
 - **Handle failures** - Monitor logs for errors and restart if needed
 - **Use try/finally** - Ensure cleanup happens even on errors

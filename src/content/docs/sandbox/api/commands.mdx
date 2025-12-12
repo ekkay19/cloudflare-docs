@@ -106,6 +106,7 @@ const process = await sandbox.startProcess(command: string, options?: ProcessOpt
 - `getLogs()` - Get accumulated logs
 - `waitForPort()` - Wait for process to listen on a port
 - `waitForLog()` - Wait for pattern in process output
+- `waitForExit()` - Wait for process to exit and get exit code with output
 
 <TypeScriptExample>
 ```
@@ -315,6 +316,52 @@ await server.waitForLog('Ready', 30000);
 **Throws**:
 - `ProcessReadyTimeoutError` - If pattern is not found within timeout
 - `ProcessExitedBeforeReadyError` - If process exits before pattern appears
+
+### `process.waitForExit()`
+
+Wait for a process to complete and return its exit code along with output.
+
+```ts
+const result = await process.waitForExit(timeout?: number): Promise<WaitForExitResult>
+```
+
+**Parameters**:
+- `timeout` - Maximum wait time in milliseconds (optional)
+
+**Returns**: `Promise<WaitForExitResult>` with:
+- `exitCode` - Process exit code (0 for success, non-zero for failure)
+- `stdout` - Accumulated stdout output
+- `stderr` - Accumulated stderr output
+
+Useful for processes that complete on their own (builds, scripts, tests) rather than long-running services. Unlike `exec()`, this method is designed for background processes started with `startProcess()`.
+
+<TypeScriptExample>
+```
+const build = await sandbox.startProcess('npm run build');
+
+// Wait for build to complete
+const result = await build.waitForExit(60000);
+
+if (result.exitCode === 0) {
+  console.log('Build succeeded');
+  console.log('Output:', result.stdout);
+} else {
+  console.error('Build failed with code:', result.exitCode);
+  console.error('Error:', result.stderr);
+}
+
+// Run tests and validate exit code
+const tests = await sandbox.startProcess('npm test');
+const testResult = await tests.waitForExit();
+
+if (testResult.exitCode !== 0) {
+  throw new Error(`Tests failed: ${testResult.stderr}`);
+}
+```
+</TypeScriptExample>
+
+**Throws**:
+- `ProcessReadyTimeoutError` - If process does not exit within timeout
 
 ## Related resources
 
