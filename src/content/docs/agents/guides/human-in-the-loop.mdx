@@ -108,17 +108,6 @@ const getWeatherInformationTool = tool({
   // no execute function - requires human approval
 });
 
-// Client-side tool that requires confirmation
-const getLocalTimeTool = tool({
-  description: "Get the local time for a specified location",
-  inputSchema: z.object({ location: z.string() }),
-  execute: async ({ location }) => {
-    console.log(`Getting local time for ${location}`);
-    await new Promise((res) => setTimeout(res, 2000));
-    return "10am";
-  }
-});
-
 // Server-side tool that does NOT require confirmation
 const getLocalNewsTool = tool({
   description: "Get local news for a specified location",
@@ -132,30 +121,46 @@ const getLocalNewsTool = tool({
 
 // Export AI SDK tools for server-side use
 export const tools = {
-  getLocalTime: {
-    description: getLocalTimeTool.description,
-    inputSchema: getLocalTimeTool.inputSchema
-  },
   getWeatherInformation: getWeatherInformationTool,
   getLocalNews: getLocalNewsTool
 };
 
 // Export AITool format for client-side use
+// AITool uses JSON Schema (not Zod) because it needs to be serialized over the wire.
+// Only tools with `execute` need `parameters` - they get extracted and sent to the server.
+// Tools without `execute` are server-side only and just need description for display.
 export const clientTools: Record<string, AITool> = {
-  getLocalTime: getLocalTimeTool as AITool,
+  getLocalTime: {
+    description: "get the local time for a specified location",
+    parameters: {
+      type: "object",
+      properties: {
+        location: { type: "string" }
+      },
+      required: ["location"]
+    },
+    execute: async (input) => {
+      const { location } = input as { location: string };
+      console.log(`Getting local time for ${location}`);
+      await new Promise((res) => setTimeout(res, 2000));
+      return "10am";
+    }
+  },
+  // Server-side tools: no execute, no parameters needed (schema lives on server)
   getWeatherInformation: {
-    description: getWeatherInformationTool.description,
-    inputSchema: getWeatherInformationTool.inputSchema
+    description:
+      "Get the current weather information for a specific city. Always use this tool when the user asks about weather."
   },
   getLocalNews: {
-    description: getLocalNewsTool.description,
-    inputSchema: getLocalNewsTool.inputSchema
+    description: "get local news for a specified location"
   }
 };
 ````
 
 :::note
-Tools **without** an `execute` function require human approval before they can run. The server will handle execution after the user confirms. Tools **with** an `execute` function can either run automatically or require confirmation based on your configuration.
+**Client-side tools** (with an `execute` function) run in the browser and can either execute automatically or require human confirmation based on your `toolsRequiringConfirmation` configuration. **Server-side tools** (without an `execute` function) run on the server after receiving approval.
+
+When defining client-side tools, use JSON Schema for the `parameters` field instead of Zod, as the tool definitions need to be serialized and sent over the network.
 :::
 
 ## 4. Create utility functions
@@ -215,6 +220,75 @@ export async function getWeatherInformation(args: unknown): Promise<string> {
     conditions[Math.floor(Math.random() * conditions.length)]
   }.`;
 }
+
+// Helper type to infer tool arguments from Zod schema
+type InferArgs<T extends { inputSchema?: { parse: (args: unknown) => unknown } }> =
+  T extends { inputSchema: { parse: (args: unknown) => infer R } } ? R : never;
+
+// Process tool calls after user confirmation
+export async function processToolCalls<
+  Tools extends ToolSet,
+  K extends keyof Tools & string = keyof Tools & string
+>(
+  {
+    messages,
+    tools: _tools
+  }: {
+    tools: Tools; // used for type inference
+    messages: UIMessage[];
+  },
+  executeFunctions: {
+    [key in K]?: (args: InferArgs<Tools[key]>) => Promise<string>;
+  }
+): Promise<UIMessage[]> {
+  const lastMessage = messages[messages.length - 1];
+  if (!lastMessage?.parts) return messages;
+
+  const updatedParts = await Promise.all(
+    lastMessage.parts.map(async (part) => {
+      if (isToolConfirmationPart(part) && part.type.startsWith("tool-")) {
+        const toolName = part.type.slice("tool-".length) as K;
+        const toolInput = part.input;
+        const output = part.output;
+
+        if (!toolsRequiringConfirmation.includes(toolName)) {
+          return part;
+        }
+
+        let result: string | undefined;
+
+        if (output === APPROVAL.YES) {
+          const toolInstance =
+            executeFunctions[toolName as keyof typeof executeFunctions];
+          if (toolInstance) {
+            result = await (
+              toolInstance as (args: typeof toolInput) => Promise<string>
+            )(toolInput);
+          } else {
+            result = "Error: No execute function found on tool";
+          }
+        } else {
+          result = "Error: User denied access to tool execution";
+        }
+
+        // Return updated part with actual tool result (not the confirmation)
+        if (result !== undefined) {
+          return {
+            ...part,
+            output: result
+          };
+        }
+        return part;
+      }
+      return part; // Return unprocessed parts
+    })
+  );
+
+  return [
+    ...messages.slice(0, -1),
+    { ...lastMessage, parts: updatedParts }
+  ];
+}
 ```
 
 ## 5. Create your Agent
@@ -227,8 +301,6 @@ import { routeAgentRequest } from "agents";
 import { AIChatAgent } from "agents/ai-chat-agent";
 import {
   convertToModelMessages,
-  createUIMessageStream,
-  createUIMessageStreamResponse,
   type StreamTextOnFinishCallback,
   streamText,
   stepCountIs
@@ -251,16 +323,43 @@ export class HumanInTheLoop extends AIChatAgent<Env> {
 
     // Check if the last message contains tool confirmations
     if (hasToolConfirmation(lastMessage)) {
-      // Process tool confirmations using UI stream
-      const stream = createUIMessageStream({
-        execute: async ({ writer }) => {
-          await processToolCalls(
-            { writer, messages: this.messages, tools },
-            { getWeatherInformation }
-          );
+      // Process tool confirmations - execute the tool and update messages
+      const updatedMessages = await processToolCalls(
+        { messages: this.messages, tools },
+        { getWeatherInformation }
+      );
+
+      // Update the agent's messages with the actual tool results
+      // This replaces "Yes, confirmed." with the actual tool output
+      this.messages = updatedMessages;
+      await this.persistMessages(this.messages);
+
+      // Now continue with streamText so the LLM can respond to the tool result
+      const result = streamText({
+        messages: convertToModelMessages(this.messages),
+        model: openai("gpt-4o"),
+        onFinish,
+        tools,
+        stopWhen: stepCountIs(5)
+      });
+
+      return result.toUIMessageStreamResponse({
+        messageMetadata: ({ part }) => {
+          if (part.type === "start") {
+            return {
+              model: "gpt-4o",
+              createdAt: Date.now(),
+              messageCount: this.messages.length
+            };
+          }
+          if (part.type === "finish") {
+            return {
+              responseTime: Date.now() - startTime,
+              totalTokens: part.totalUsage?.totalTokens
+            };
+          }
         }
       });
-      return createUIMessageStreamResponse({ stream });
     }
 
     // Normal message flow - stream AI response
@@ -330,7 +429,9 @@ export default function Chat() {
     agent,
     experimental_automaticToolResolution: true,
     toolsRequiringConfirmation,
-    tools: clientTools satisfies Record<string, AITool>
+    tools: clientTools satisfies Record<string, AITool>,
+    // Enable server auto-continuation after tool results for seamless UX
+    autoContinueAfterToolResult: true
   });
 
   const [input, setInput] = useState("");
@@ -415,6 +516,8 @@ export default function Chat() {
                               type="button"
                               className="button-approve"
                               onClick={async () => {
+                                // we execute it and set the result, otherwise we
+                                // set the approval and let the server handle it
                                 const output = tool.execute
                                   ? await tool.execute(part.input)
                                   : APPROVAL.YES;
@@ -528,11 +631,22 @@ The human-in-the-loop pattern works by intercepting tool calls before execution:
 
 ### Message streaming with confirmations
 
-The agent uses the Vercel AI SDK's streaming capabilities:
+The agent uses the Vercel AI SDK streaming capabilities:
 
-- `createUIMessageStream` creates a stream for processing tool confirmations.
-- `streamText` handles normal AI responses with tool calls.
+- `streamText` handles AI responses with tool calls.
 - The `hasToolConfirmation` function detects when a message contains a tool confirmation response.
+- After processing confirmations, the agent continues with `streamText` to let the LLM respond to the tool result.
+
+### Auto-continuation after tool results
+
+The `autoContinueAfterToolResult` option enables seamless tool execution flow:
+
+1. **Client executes the tool** and sends the result to the server (via `CF_AGENT_TOOL_RESULT` message).
+2. **Server automatically calls `onChatMessage()`** to continue the conversation.
+3. **The LLM continuation is merged** into the same assistant message.
+4. **User sees a single, seamless response** instead of a fragmented conversation.
+
+Without this option, client-side tool execution would require the user to send another message for the assistant to continue. With this option enabled, the flow is automatic and mimics server-side tool behavior.
 
 ### State persistence
 
@@ -559,25 +673,36 @@ export const toolsRequiringConfirmation = [
 
 ### Implement custom tool handlers
 
-For server-side tools requiring confirmation, add execute functions in your agent:
+For server-side tools requiring confirmation, add execute functions to the `processToolCalls` call in your agent:
 
 ```ts
 if (hasToolConfirmation(lastMessage)) {
-  const stream = createUIMessageStream({
-    execute: async ({ writer }) => {
-      await processToolCalls(
-        { writer, messages: this.messages, tools },
-        {
-          getWeatherInformation,
-          sendEmail: async ({ to, subject, body }) => {
-            // Your email sending logic
-            return `Email sent to ${to}`;
-          }
-        }
-      );
+  // Process tool confirmations - execute the tool and update messages
+  const updatedMessages = await processToolCalls(
+    { messages: this.messages, tools },
+    {
+      getWeatherInformation,
+      sendEmail: async ({ to, subject, body }) => {
+        // Your email sending logic
+        return `Email sent to ${to}`;
+      }
     }
+  );
+
+  // Update the agent's messages with the actual tool results
+  this.messages = updatedMessages;
+  await this.persistMessages(this.messages);
+
+  // Continue with streamText so the LLM can respond to the tool result
+  const result = streamText({
+    messages: convertToModelMessages(this.messages),
+    model: openai("gpt-4o"),
+    onFinish,
+    tools,
+    stopWhen: stepCountIs(5)
   });
-  return createUIMessageStreamResponse({ stream });
+
+  return result.toUIMessageStreamResponse();
 }
 ```
 

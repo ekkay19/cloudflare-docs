@@ -947,6 +947,13 @@ type UseAgentChatOptions = Omit<
 	Parameters<typeof useChat>[0] & {
 		// Agent connection from useAgent
 		agent: ReturnType<typeof useAgent>;
+		// Client-side tools with optional execute functions
+		tools?: Record<string, AITool>;
+		// List of tool names that require human confirmation before execution
+		toolsRequiringConfirmation?: string[];
+		// When true, automatically continues the conversation after client-side tool execution
+		// This mimics server-side tool behavior for a seamless user experience
+		autoContinueAfterToolResult?: boolean;
 	},
 	"fetch"
 >;
@@ -1074,8 +1081,102 @@ function ChatInterface() {
 
 </TypeScriptExample>
 
+#### Client-side tools with human-in-the-loop
+
+`useAgentChat` supports client-side tools with optional human confirmation workflows. This is useful when you want tools to execute in the browser (for example, accessing local storage, camera, or geolocation) while maintaining control over which tools require user approval.
+
+<TypeScriptExample>
+
+```tsx
+import { useAgentChat } from "agents/ai-react";
+import { useAgent } from "agents/react";
+import type { AITool } from "agents/ai-react";
+
+// Define client-side tools using JSON Schema
+const clientTools: Record<string, AITool> = {
+  getLocation: {
+    description: "Get the user's current location",
+    parameters: {
+      type: "object",
+      properties: {}
+    },
+    execute: async () => {
+      // This runs in the browser
+      return new Promise((resolve, reject) => {
+        navigator.geolocation.getCurrentPosition(
+          (position) => resolve(`${position.coords.latitude},${position.coords.longitude}`),
+          (error) => reject(error)
+        );
+      });
+    }
+  },
+  sendEmail: {
+    description: "Send an email (server-side only, requires approval)"
+    // No execute function - handled by server after approval
+  }
+};
+
+function ChatWithTools() {
+  const agent = useAgent({ agent: "assistant" });
+
+  const { messages, addToolResult } = useAgentChat({
+    agent,
+    tools: clientTools,
+    // Tools that require human confirmation before execution
+    toolsRequiringConfirmation: ["getLocation", "sendEmail"],
+    // Automatically continue after tool execution for seamless UX
+    autoContinueAfterToolResult: true,
+    experimental_automaticToolResolution: true
+  });
+
+  return (
+    <div>
+      {messages.map((message) => (
+        <div key={message.id}>
+          {message.parts?.map((part) => {
+            // Show approval UI for tools requiring confirmation
+            if (part.type?.startsWith("tool-") && part.state === "input-available") {
+              const toolName = part.type.slice("tool-".length);
+              const tool = clientTools[toolName];
+
+              return (
+                <div key={part.toolCallId}>
+                  <p>Approve {toolName}?</p>
+                  <button onClick={async () => {
+                    const output = tool.execute
+                      ? await tool.execute(part.input)
+                      : "Yes, confirmed.";
+                    addToolResult({
+                      tool: toolName,
+                      output,
+                      toolCallId: part.toolCallId
+                    });
+                  }}>
+                    Approve
+                  </button>
+                </div>
+              );
+            }
+            return part.type === "text" ? part.text : null;
+          })}
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+</TypeScriptExample>
+
+:::note
+
+**Client-side tools** (with `execute` function) run in the browser. **Server-side tools** (without `execute`) run on the server after approval. Use JSON Schema for the `parameters` field, as tool definitions are serialized over the network.
+
+:::
+
 ### Next steps
 
 - [Build a chat Agent](/agents/getting-started/build-a-chat-agent/) using the Agents SDK and deploy it to Workers.
+- [Build a Human-in-the-Loop Agent](/agents/guides/human-in-the-loop/) with client-side tools and approval workflows.
 - Learn more [using WebSockets](/agents/api-reference/websockets/) to build interactive Agents and stream data back from your Agent.
 - [Orchestrate asynchronous workflows](/agents/api-reference/run-workflows) from your Agent by combining the Agents SDK and [Workflows](/workflows).
